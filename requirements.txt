@@ -1,0 +1,10 @@
+runpod>=1.7,<2
+diffusers>=0.35,<1
+transformers>=4.51,<5
+accelerate>=1.6,<2
+safetensors>=0.5,<1
+sentencepiece>=0.2,<1
+protobuf>=5,<7
+imageio[ffmpeg]>=2.37,<3
+peft>=0.15,<1
+huggingface_hub>=0.30,<1
