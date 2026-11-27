@@ -1,4 +1,5 @@
 """One model per RunPod queue worker. GPU inference + private Supabase Storage."""
+import hashlib
 import io
 import os
 import re
@@ -13,15 +14,16 @@ import torch
 from PIL import Image, ImageOps
 from diffusers import AutoPipelineForImage2Image, AutoencoderKLWan, Flux2KleinPipeline, FluxPipeline, StableDiffusionXLPipeline, WanImageToVideoPipeline, WanPipeline
 from diffusers.utils import export_to_video
+from upscale import WEIGHTS_SHA256, WEIGHTS_URL, upscale
 
 Image.MAX_IMAGE_PIXELS = 40_000_000  # Refuse decompression bombs from uploaded photos.
 
 # MODEL_ARCH picks the model family. MODEL_KIND is kept for older endpoints: image -> flux, video -> wan.
 KIND = os.getenv("MODEL_KIND", "image")
 ARCH = os.getenv("MODEL_ARCH") or ("wan" if KIND == "video" else "flux")
-DEFAULT_MODELS = {"flux": "black-forest-labs/FLUX.1-schnell", "sdxl": "stabilityai/stable-diffusion-xl-base-1.0", "wan": "Wan-AI/Wan2.1-T2V-1.3B-Diffusers", "wan22": "Wan-AI/Wan2.2-TI2V-5B-Diffusers", "klein": "black-forest-labs/FLUX.2-klein-4B", "flux3": "black-forest-labs/flux-3-image-klein"}
+DEFAULT_MODELS = {"upscale": "RealESRGAN_x4plus", "flux": "black-forest-labs/FLUX.1-schnell", "sdxl": "stabilityai/stable-diffusion-xl-base-1.0", "wan": "Wan-AI/Wan2.1-T2V-1.3B-Diffusers", "wan22": "Wan-AI/Wan2.2-TI2V-5B-Diffusers", "klein": "black-forest-labs/FLUX.2-klein-4B", "flux3": "black-forest-labs/flux-3-image-klein"}
 if ARCH not in DEFAULT_MODELS:
-    raise RuntimeError("MODEL_ARCH must be flux, flux3, sdxl, klein, wan or wan22")
+    raise RuntimeError("MODEL_ARCH must be flux, flux3, sdxl, klein, wan, wan22 or upscale")
 IS_VIDEO = ARCH in {"wan", "wan22"}
 MODEL_ID = os.getenv("MODEL_ID", DEFAULT_MODELS[ARCH])
 SUPABASE_URL = os.environ["SUPABASE_URL"].rstrip("/")
@@ -35,7 +37,33 @@ SIZED = {
     "standard": {"square": (1024, 1024), "landscape": (1344, 768), "portrait": (768, 1344), "wide": (1360, 768), "classic": (1248, 832), "ultrawide": (1568, 672)},
     "high": {"square": (1440, 1440), "landscape": (1888, 1088), "portrait": (1088, 1888), "wide": (1920, 1088), "classic": (1776, 1184), "ultrawide": (2208, 944)},
 }
-if ARCH == "flux3":
+# FLUX.2 klein output sizes; the web server keeps the same table.
+KLEIN_SIZED = {
+    "standard": {"square": (1024, 1024), "landscape": (1344, 768), "portrait": (768, 1344)},
+    "2k": {"square": (2048, 2048), "landscape": (2688, 1536), "portrait": (1536, 2688)},
+}
+
+
+def load_upscaler():
+    """Download the Real-ESRGAN weights once, refusing anything but the expected file."""
+    cache = Path(os.getenv("UPSCALER_CACHE", "/runpod-volume/upscaler"))
+    cache.mkdir(parents=True, exist_ok=True)
+    target = cache / "RealESRGAN_x4plus.pth"
+    if not target.exists() or hashlib.sha256(target.read_bytes()).hexdigest() != WEIGHTS_SHA256:
+        with urllib.request.urlopen(WEIGHTS_URL, timeout=300) as response:
+            raw = response.read(100 * 1024 * 1024)
+        if hashlib.sha256(raw).hexdigest() != WEIGHTS_SHA256:
+            raise RuntimeError("The upscaler download did not match its checksum.")
+        partial = target.with_suffix(f".{os.getpid()}.part")
+        partial.write_bytes(raw)
+        partial.replace(target)
+    return ModelLoader().load_from_file(target).model.to("cuda").eval()
+
+
+if ARCH == "upscale":
+    from spandrel import ModelLoader
+    pipe = load_upscaler()
+elif ARCH == "flux3":
     # Needs its own image (Dockerfile.flux3) and an HF_TOKEN whose account accepted the model's license.
     from diffusers import ComponentsManager, ModularPipeline
     from transformers import pipeline as transformers_pipeline
@@ -135,9 +163,9 @@ def fetch_reference(spec, width=None, height=None):
     return ImageOps.fit(image, (width, height), Image.LANCZOS) if width else image  # Cover-crop to the requested shape.
 
 
-def matched_size(photo_width, photo_height, quality):
-    """The photo's shape at the chosen quality's pixel count, on the 16-pixel grid."""
-    area = SIZED[quality]["square"][0] * SIZED[quality]["square"][1]
+def matched_size(photo_width, photo_height, square):
+    """The photo's shape with the pixel count of the given square size, on the 16-pixel grid."""
+    area = square[0] * square[1]
     ratio = min(max(photo_width / photo_height, 1 / 3), 3)
     return tuple(max(256, round(side / 16) * 16) for side in ((area * ratio) ** 0.5, (area / ratio) ** 0.5))
 
@@ -153,6 +181,14 @@ def handler(job):
         return {"error": "Prompt must contain 1–2000 characters."}
     if data.get("model") != ARCH:
         return {"error": "This endpoint is configured for a different model."}
+    if ARCH == "upscale":
+        try:
+            source = fetch_reference(data.get("reference"))
+            return run({"source": source, "seed": 0}, user_id, job_id)
+        except torch.cuda.OutOfMemoryError:
+            return {"error": "The GPU ran out of memory while upscaling. Try a smaller image."}
+        except ValueError as error:  # A bad link or an unsupported size, explained to the user.
+            return {"error": str(error)[:300]}
     sizes = {(480, 480), (832, 480), (480, 832)} if IS_VIDEO else {(1024, 1024), (1344, 768), (768, 1344)}
     width, height = data.get("width"), data.get("height")
     match_photo = ARCH == "flux3" and data.get("aspect") == "match"
@@ -161,6 +197,11 @@ def handler(job):
         if quality not in SIZED:
             return {"error": "Unsupported quality."}
         sizes = set(SIZED[quality].values())
+    if ARCH == "klein":
+        quality = data.get("quality", "standard")
+        if quality not in KLEIN_SIZED:
+            return {"error": "Unsupported quality."}
+        sizes = set(KLEIN_SIZED[quality].values())
     if (width, height) not in sizes:
         return {"error": "Unsupported dimensions."}
     seed = data.get("seed", 0)
@@ -182,12 +223,25 @@ def handler(job):
         try:
             # Editing keeps the photo's own shape; everything else is cover-cropped to the requested size.
             reference = fetch_reference(data["reference"]) if ARCH in {"klein", "flux3"} else fetch_reference(data["reference"], width, height)
-        except Exception as error:  # Reported to the user; the web server refunds the credits.
+        except Exception as error:  # Reported to the user; the web server marks the job failed.
             return {"error": f"The reference photo could not be used: {str(error)[:300]}"}
+    extra_references = []
+    extra_specs = data.get("extra_references") or []
+    if extra_specs:
+        if ARCH != "klein" or reference is None or not isinstance(extra_specs, list) or len(extra_specs) > 3:
+            return {"error": "FLUX.2 klein accepts up to 4 reference photos."}
+        try:
+            extra_references = [fetch_reference(spec) for spec in extra_specs]
+        except Exception as error:
+            return {"error": f"A reference photo could not be used: {str(error)[:300]}"}
     if match_photo:
         if reference is None:
             return {"error": "Add a photo to match its shape."}
-        width, height = matched_size(reference.width, reference.height, quality)
+        width, height = matched_size(reference.width, reference.height, SIZED[quality]["square"])
+    # Without an explicit size, klein returns at most about 1 MP when editing. At 2k, ask for the photo's shape at 4 MP.
+    edit_size = None
+    if ARCH == "klein" and reference is not None and quality == "2k":
+        edit_size = matched_size(reference.width, reference.height, KLEIN_SIZED["2k"]["square"])
     if data.get("style") is not None:
         if ARCH != "sdxl":
             return {"error": "This model cannot use a style reference."}
@@ -204,7 +258,7 @@ def handler(job):
             lora_path, lora_strength = fetch_lora(data["lora"])
         except Exception as error:
             return {"error": f"LoRA could not be loaded: {str(error)[:300]}"}
-    params = dict(prompt=prompt, negative=negative, width=width, height=height, seed=seed, reference=reference, strength=strength, style=style, style_strength=style_strength)
+    params = dict(extra_references=extra_references, edit_size=edit_size, prompt=prompt, negative=negative, width=width, height=height, seed=seed, reference=reference, strength=strength, style=style, style_strength=style_strength)
     try:
         if lora_path:
             try:
@@ -223,6 +277,9 @@ class Blocked(Exception):
 
 
 def generate(output, p):
+    if ARCH == "upscale":
+        upscale(pipe, p["source"]).save(output)
+        return
     generator = torch.Generator("cpu").manual_seed(p["seed"])
     if ARCH == "flux":
         pipe(prompt=p["prompt"], width=p["width"], height=p["height"], generator=generator, num_inference_steps=4, guidance_scale=0.0, max_sequence_length=256).images[0].save(output)
@@ -234,7 +291,16 @@ def generate(output, p):
         image.save(output)
     elif ARCH == "klein":
         size = {} if p["reference"] is not None else {"height": p["height"], "width": p["width"]}  # With a photo, the output follows its shape.
-        image = pipe(image=[p["reference"]] if p["reference"] is not None else None, prompt=p["prompt"], guidance_scale=1.0, num_inference_steps=4, generator=generator, **size).images[0]
+        if p["edit_size"]:
+            size = {"width": p["edit_size"][0], "height": p["edit_size"][1]}
+        photos = [p["reference"], *p["extra_references"]] if p["reference"] is not None else None
+        if p["extra_references"] and not size:  # With several photos, the output follows the shape of photo 1.
+            width, height = matched_size(p["reference"].width, p["reference"].height, KLEIN_SIZED["standard"]["square"])
+            size = {"width": width, "height": height}
+        try:
+            image = pipe(image=photos, prompt=p["prompt"], guidance_scale=1.0, num_inference_steps=4, generator=generator, **size).images[0]
+        except torch.cuda.OutOfMemoryError as error:
+            raise Blocked("The GPU ran out of memory. Use fewer reference photos or Standard quality.") from error
         image.save(output)
     elif ARCH == "sdxl":
         target = img2img if p["reference"] is not None else pipe
@@ -266,7 +332,7 @@ def run(p, user_id, job_id):
         mime = "video/mp4" if IS_VIDEO else "image/png"
         try:
             generate(output, p)
-        except Blocked as error:  # Reported to the user; the web server refunds the credits.
+        except Blocked as error:  # Reported to the user; the web server marks the job failed.
             return {"error": str(error)}
         key = f"{user_id}/{job_id}{output.suffix}"
         if output.stat().st_size > 104857600:
@@ -282,7 +348,8 @@ def run(p, user_id, job_id):
                     raise RuntimeError("Private output upload failed")
         except urllib.error.HTTPError as error:  # Include Supabase's explanation (e.g. a missing bucket) in the job error.
             raise RuntimeError(f"Output upload failed: HTTP {error.code} {error.read(300).decode('utf-8', 'replace')}") from error
-        return {"storage_path": key, "mime": mime, "seed": p["seed"]}
+        used = {"references": 1 + len(p["extra_references"])} if p.get("extra_references") else {}
+        return {"storage_path": key, "mime": mime, "seed": p["seed"], **used}
 
 
 if __name__ == "__main__":

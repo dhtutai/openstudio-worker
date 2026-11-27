@@ -4,6 +4,6 @@ COPY requirements-flux3.txt .
 RUN pip install --no-cache-dir -r requirements-flux3.txt
 # Fail the build, not a paid GPU job, if a class the FLUX 3 pipeline needs cannot be imported.
 RUN python -c "from diffusers import ComponentsManager, ModularPipeline, AutoPipelineForImage2Image, AutoencoderKLWan, Flux2KleinPipeline, FluxPipeline, StableDiffusionXLPipeline, WanImageToVideoPipeline, WanPipeline; from diffusers.modular_pipelines.flux3 import modular_blocks_flux3_distilled; from transformers import Qwen3_5ForConditionalGeneration, Qwen3VLForConditionalGeneration, pipeline"
-COPY handler.py .
+COPY handler.py upscale.py ./
 ENV HF_HOME=/runpod-volume/huggingface
 CMD ["python", "-u", "handler.py"]
