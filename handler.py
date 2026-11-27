@@ -21,10 +21,11 @@ Image.MAX_IMAGE_PIXELS = 40_000_000  # Refuse decompression bombs from uploaded 
 # MODEL_ARCH picks the model family. MODEL_KIND is kept for older endpoints: image -> flux, video -> wan.
 KIND = os.getenv("MODEL_KIND", "image")
 ARCH = os.getenv("MODEL_ARCH") or ("wan" if KIND == "video" else "flux")
-DEFAULT_MODELS = {"upscale": "RealESRGAN_x4plus", "flux": "black-forest-labs/FLUX.1-schnell", "sdxl": "stabilityai/stable-diffusion-xl-base-1.0", "wan": "Wan-AI/Wan2.1-T2V-1.3B-Diffusers", "wan22": "Wan-AI/Wan2.2-TI2V-5B-Diffusers", "klein": "black-forest-labs/FLUX.2-klein-4B", "flux3": "black-forest-labs/flux-3-image-klein"}
+DEFAULT_MODELS = {"upscale": "RealESRGAN_x4plus", "flux": "black-forest-labs/FLUX.1-schnell", "sdxl": "stabilityai/stable-diffusion-xl-base-1.0", "wan": "Wan-AI/Wan2.1-T2V-1.3B-Diffusers", "wan22": "Wan-AI/Wan2.2-TI2V-5B-Diffusers", "wan22a14b": "Wan-AI/Wan2.2-I2V-A14B-Diffusers", "klein": "black-forest-labs/FLUX.2-klein-4B", "flux3": "black-forest-labs/flux-3-image-klein"}
 if ARCH not in DEFAULT_MODELS:
-    raise RuntimeError("MODEL_ARCH must be flux, flux3, sdxl, klein, wan, wan22 or upscale")
-IS_VIDEO = ARCH in {"wan", "wan22"}
+    raise RuntimeError("MODEL_ARCH must be flux, flux3, sdxl, klein, wan, wan22, wan22a14b or upscale")
+IS_VIDEO = ARCH in {"wan", "wan22", "wan22a14b"}
+ANIMATES_PHOTO = {"wan22", "wan22a14b"}
 MODEL_ID = os.getenv("MODEL_ID", DEFAULT_MODELS[ARCH])
 SUPABASE_URL = os.environ["SUPABASE_URL"].rstrip("/")
 SUPABASE_KEY = os.environ["SUPABASE_SERVICE_ROLE_KEY"]
@@ -37,6 +38,9 @@ SIZED = {
     "standard": {"square": (1024, 1024), "landscape": (1344, 768), "portrait": (768, 1344), "wide": (1360, 768), "classic": (1248, 832), "ultrawide": (1568, 672)},
     "high": {"square": (1440, 1440), "landscape": (1888, 1088), "portrait": (1088, 1888), "wide": (1920, 1088), "classic": (1776, 1184), "ultrawide": (2208, 944)},
 }
+# Wan 2.2 14B: pixel count for each resolution, and the frame counts for 3, 5 and 8 seconds at 16 fps. Matches the web server.
+WAN_AREAS = {"standard": (480, 832), "720p": (720, 1280)}
+WAN_FRAMES = {49, 81, 129}
 # FLUX.2 klein output sizes; the web server keeps the same table.
 KLEIN_SIZED = {
     "standard": {"square": (1024, 1024), "landscape": (1344, 768), "portrait": (768, 1344)},
@@ -88,6 +92,12 @@ elif ARCH == "sdxl":
     pipe = StableDiffusionXLPipeline.from_pretrained(MODEL_ID, torch_dtype=torch.float16, variant="fp16", use_safetensors=True)
     pipe.to("cuda")  # SDXL fits on a 24 GB card without offload.
     img2img = AutoPipelineForImage2Image.from_pipe(pipe)  # Shares the same weights; used when a reference photo is given.
+elif ARCH == "wan22a14b":
+    # Wan 2.2 14B image-to-video: two 14B transformers take turns. Offload keeps only the active one on the GPU.
+    vae = AutoencoderKLWan.from_pretrained(MODEL_ID, subfolder="vae", torch_dtype=torch.float32)
+    pipe = WanImageToVideoPipeline.from_pretrained(MODEL_ID, vae=vae, torch_dtype=torch.bfloat16)
+    pipe.enable_model_cpu_offload()
+    pipe.vae.enable_tiling()
 elif ARCH == "wan22":
     # Wan 2.2 5B animates a photo (image-to-video only here); one pipeline keeps GPU offload simple on a 24 GB card.
     vae = AutoencoderKLWan.from_pretrained(MODEL_ID, subfolder="vae", torch_dtype=torch.float32)
@@ -211,10 +221,10 @@ def handler(job):
     if not isinstance(negative, str) or len(negative) > 2000:
         return {"error": "Invalid negative prompt."}
     reference = strength = style = style_strength = None
-    if ARCH == "wan22" and data.get("reference") is None:
+    if ARCH in ANIMATES_PHOTO and data.get("reference") is None:
         return {"error": "This model animates a photo. Add a photo and try again."}
     if data.get("reference") is not None:
-        if img2img is None and ARCH not in {"wan22", "klein", "flux3"}:
+        if img2img is None and ARCH not in {"wan22", "wan22a14b", "klein", "flux3"}:
             return {"error": "This model cannot use a reference photo."}
         if img2img is not None:  # Only photo-to-image has a strength control.
             strength = data.get("strength", 0.7)
@@ -222,7 +232,7 @@ def handler(job):
                 return {"error": "Strength must be between 0.1 and 1."}
         try:
             # Editing keeps the photo's own shape; everything else is cover-cropped to the requested size.
-            reference = fetch_reference(data["reference"]) if ARCH in {"klein", "flux3"} else fetch_reference(data["reference"], width, height)
+            reference = fetch_reference(data["reference"]) if ARCH in {"klein", "flux3", "wan22a14b"} else fetch_reference(data["reference"], width, height)
         except Exception as error:  # Reported to the user; the web server marks the job failed.
             return {"error": f"The reference photo could not be used: {str(error)[:300]}"}
     extra_references = []
@@ -234,6 +244,15 @@ def handler(job):
             extra_references = [fetch_reference(spec) for spec in extra_specs]
         except Exception as error:
             return {"error": f"A reference photo could not be used: {str(error)[:300]}"}
+    num_frames = 81
+    if ARCH == "wan22a14b":  # The video keeps the photo's shape at the chosen pixel count; crop only the few pixels of rounding.
+        quality, num_frames = data.get("quality", "standard"), data.get("num_frames", 81)
+        if quality not in WAN_AREAS:
+            return {"error": "Unsupported resolution."}
+        if type(num_frames) is not int or num_frames not in WAN_FRAMES:
+            return {"error": "Unsupported video length."}
+        width, height = matched_size(reference.width, reference.height, WAN_AREAS[quality])
+        reference = ImageOps.fit(reference, (width, height), Image.LANCZOS)
     if match_photo:
         if reference is None:
             return {"error": "Add a photo to match its shape."}
@@ -258,7 +277,7 @@ def handler(job):
             lora_path, lora_strength = fetch_lora(data["lora"])
         except Exception as error:
             return {"error": f"LoRA could not be loaded: {str(error)[:300]}"}
-    params = dict(extra_references=extra_references, edit_size=edit_size, prompt=prompt, negative=negative, width=width, height=height, seed=seed, reference=reference, strength=strength, style=style, style_strength=style_strength)
+    params = dict(num_frames=num_frames, extra_references=extra_references, edit_size=edit_size, prompt=prompt, negative=negative, width=width, height=height, seed=seed, reference=reference, strength=strength, style=style, style_strength=style_strength)
     try:
         if lora_path:
             try:
@@ -318,6 +337,9 @@ def generate(output, p):
             if p["style"] is not None:
                 target.unload_ip_adapter()
         image.save(output)
+    elif ARCH == "wan22a14b":
+        frames = pipe(image=p["reference"], prompt=p["prompt"], negative_prompt=p["negative"] or None, height=p["height"], width=p["width"], num_frames=p["num_frames"], num_inference_steps=40, guidance_scale=3.5, generator=generator).frames[0]
+        export_to_video(frames, str(output), fps=16)
     elif ARCH == "wan22":
         frames = pipe(image=p["reference"], prompt=p["prompt"], negative_prompt=p["negative"] or None, height=p["height"], width=p["width"], num_frames=81, num_inference_steps=30, guidance_scale=5.0, generator=generator).frames[0]
         export_to_video(frames, str(output), fps=24)
