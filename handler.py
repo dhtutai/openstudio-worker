@@ -11,7 +11,7 @@ import runpod
 from huggingface_hub import hf_hub_download
 import torch
 from PIL import Image, ImageOps
-from diffusers import AutoPipelineForImage2Image, AutoencoderKLWan, FluxPipeline, StableDiffusionXLPipeline, WanImageToVideoPipeline, WanPipeline
+from diffusers import AutoPipelineForImage2Image, AutoencoderKLWan, Flux2KleinPipeline, FluxPipeline, StableDiffusionXLPipeline, WanImageToVideoPipeline, WanPipeline
 from diffusers.utils import export_to_video
 
 Image.MAX_IMAGE_PIXELS = 40_000_000  # Refuse decompression bombs from uploaded photos.
@@ -19,9 +19,9 @@ Image.MAX_IMAGE_PIXELS = 40_000_000  # Refuse decompression bombs from uploaded 
 # MODEL_ARCH picks the model family. MODEL_KIND is kept for older endpoints: image -> flux, video -> wan.
 KIND = os.getenv("MODEL_KIND", "image")
 ARCH = os.getenv("MODEL_ARCH") or ("wan" if KIND == "video" else "flux")
-DEFAULT_MODELS = {"flux": "black-forest-labs/FLUX.1-schnell", "sdxl": "stabilityai/stable-diffusion-xl-base-1.0", "wan": "Wan-AI/Wan2.1-T2V-1.3B-Diffusers", "wan22": "Wan-AI/Wan2.2-TI2V-5B-Diffusers"}
+DEFAULT_MODELS = {"flux": "black-forest-labs/FLUX.1-schnell", "sdxl": "stabilityai/stable-diffusion-xl-base-1.0", "wan": "Wan-AI/Wan2.1-T2V-1.3B-Diffusers", "wan22": "Wan-AI/Wan2.2-TI2V-5B-Diffusers", "klein": "black-forest-labs/FLUX.2-klein-4B"}
 if ARCH not in DEFAULT_MODELS:
-    raise RuntimeError("MODEL_ARCH must be flux, sdxl, wan or wan22")
+    raise RuntimeError("MODEL_ARCH must be flux, sdxl, klein, wan or wan22")
 IS_VIDEO = ARCH in {"wan", "wan22"}
 MODEL_ID = os.getenv("MODEL_ID", DEFAULT_MODELS[ARCH])
 SUPABASE_URL = os.environ["SUPABASE_URL"].rstrip("/")
@@ -32,6 +32,10 @@ if ARCH == "flux":
     pipe = FluxPipeline.from_pretrained(MODEL_ID, torch_dtype=torch.bfloat16)
     pipe.enable_model_cpu_offload()  # Offload reduces VRAM needs; cold starts and CPU transfers add latency.
     pipe.vae.enable_tiling()
+elif ARCH == "klein":
+    # FLUX.2 klein 4B (Apache-2.0, open): one model for text-to-image and editing from reference photos.
+    pipe = Flux2KleinPipeline.from_pretrained(MODEL_ID, torch_dtype=torch.bfloat16)
+    pipe.enable_model_cpu_offload()
 elif ARCH == "sdxl":
     pipe = StableDiffusionXLPipeline.from_pretrained(MODEL_ID, torch_dtype=torch.float16, variant="fp16", use_safetensors=True)
     pipe.to("cuda")  # SDXL fits on a 24 GB card without offload.
@@ -136,14 +140,15 @@ def handler(job):
     if ARCH == "wan22" and data.get("reference") is None:
         return {"error": "This model animates a photo. Add a photo and try again."}
     if data.get("reference") is not None:
-        if img2img is None and ARCH != "wan22":
+        if img2img is None and ARCH not in {"wan22", "klein"}:
             return {"error": "This model cannot use a reference photo."}
         if img2img is not None:  # Only photo-to-image has a strength control.
             strength = data.get("strength", 0.7)
             if isinstance(strength, bool) or not isinstance(strength, (int, float)) or not 0.1 <= strength <= 1:
                 return {"error": "Strength must be between 0.1 and 1."}
         try:
-            reference = fetch_reference(data["reference"], width, height)
+            # Editing keeps the photo's own shape; everything else is cover-cropped to the requested size.
+            reference = fetch_reference(data["reference"]) if ARCH == "klein" else fetch_reference(data["reference"], width, height)
         except Exception as error:  # Reported to the user; the web server refunds the credits.
             return {"error": f"The reference photo could not be used: {str(error)[:300]}"}
     if data.get("style") is not None:
@@ -180,6 +185,10 @@ def generate(output, p):
     generator = torch.Generator("cpu").manual_seed(p["seed"])
     if ARCH == "flux":
         pipe(prompt=p["prompt"], width=p["width"], height=p["height"], generator=generator, num_inference_steps=4, guidance_scale=0.0, max_sequence_length=256).images[0].save(output)
+    elif ARCH == "klein":
+        size = {} if p["reference"] is not None else {"height": p["height"], "width": p["width"]}  # With a photo, the output follows its shape.
+        image = pipe(image=[p["reference"]] if p["reference"] is not None else None, prompt=p["prompt"], guidance_scale=1.0, num_inference_steps=4, generator=generator, **size).images[0]
+        image.save(output)
     elif ARCH == "sdxl":
         target = img2img if p["reference"] is not None else pipe
         extra = {}
