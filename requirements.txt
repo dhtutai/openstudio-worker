@@ -9,3 +9,4 @@ imageio[ffmpeg]>=2.37,<3
 peft>=0.15,<1
 huggingface_hub>=0.30,<1
 Pillow>=10,<13
+ftfy>=6.2,<7
