@@ -19,16 +19,36 @@ Image.MAX_IMAGE_PIXELS = 40_000_000  # Refuse decompression bombs from uploaded 
 # MODEL_ARCH picks the model family. MODEL_KIND is kept for older endpoints: image -> flux, video -> wan.
 KIND = os.getenv("MODEL_KIND", "image")
 ARCH = os.getenv("MODEL_ARCH") or ("wan" if KIND == "video" else "flux")
-DEFAULT_MODELS = {"flux": "black-forest-labs/FLUX.1-schnell", "sdxl": "stabilityai/stable-diffusion-xl-base-1.0", "wan": "Wan-AI/Wan2.1-T2V-1.3B-Diffusers", "wan22": "Wan-AI/Wan2.2-TI2V-5B-Diffusers", "klein": "black-forest-labs/FLUX.2-klein-4B"}
+DEFAULT_MODELS = {"flux": "black-forest-labs/FLUX.1-schnell", "sdxl": "stabilityai/stable-diffusion-xl-base-1.0", "wan": "Wan-AI/Wan2.1-T2V-1.3B-Diffusers", "wan22": "Wan-AI/Wan2.2-TI2V-5B-Diffusers", "klein": "black-forest-labs/FLUX.2-klein-4B", "flux3": "black-forest-labs/flux-3-image-klein"}
 if ARCH not in DEFAULT_MODELS:
-    raise RuntimeError("MODEL_ARCH must be flux, sdxl, klein, wan or wan22")
+    raise RuntimeError("MODEL_ARCH must be flux, flux3, sdxl, klein, wan or wan22")
 IS_VIDEO = ARCH in {"wan", "wan22"}
 MODEL_ID = os.getenv("MODEL_ID", DEFAULT_MODELS[ARCH])
 SUPABASE_URL = os.environ["SUPABASE_URL"].rstrip("/")
 SUPABASE_KEY = os.environ["SUPABASE_SERVICE_ROLE_KEY"]
 HF_TOKEN = os.getenv("HF_TOKEN") or None
-img2img = None
-if ARCH == "flux":
+img2img = safety = None
+PROMPT_UPSAMPLER = os.getenv("PROMPT_UPSAMPLER", "on") != "off"
+SAFETY_THRESHOLD = float(os.getenv("SAFETY_THRESHOLD", "0.8"))
+# FLUX 3 output sizes; the web server keeps the same table.
+SIZED = {
+    "standard": {"square": (1024, 1024), "landscape": (1344, 768), "portrait": (768, 1344), "wide": (1360, 768), "classic": (1248, 832), "ultrawide": (1568, 672)},
+    "high": {"square": (1440, 1440), "landscape": (1888, 1088), "portrait": (1088, 1888), "wide": (1920, 1088), "classic": (1776, 1184), "ultrawide": (2208, 944)},
+}
+if ARCH == "flux3":
+    # Needs its own image (Dockerfile.flux3) and an HF_TOKEN whose account accepted the model's license.
+    from diffusers import ComponentsManager, ModularPipeline
+    from transformers import pipeline as transformers_pipeline
+    manager = ComponentsManager()
+    blocks = ModularPipeline.from_pretrained(MODEL_ID).blocks
+    if not PROMPT_UPSAMPLER:
+        blocks.sub_blocks.pop("prompt_upsampler")
+    pipe = blocks.init_pipeline(MODEL_ID, components_manager=manager)
+    pipe.load_components(dtype={"vae": torch.float32, "default": torch.bfloat16})
+    manager.enable_auto_cpu_offload(device="cuda")  # The model and prompt upsampler do not fit on 48 GB together.
+    # The license asks for content filtering or output review; this filters every output.
+    safety = transformers_pipeline("image-classification", model="Falconsai/nsfw_image_detection", device="cpu")
+elif ARCH == "flux":
     pipe = FluxPipeline.from_pretrained(MODEL_ID, torch_dtype=torch.bfloat16)
     pipe.enable_model_cpu_offload()  # Offload reduces VRAM needs; cold starts and CPU transfers add latency.
     pipe.vae.enable_tiling()
@@ -115,6 +135,13 @@ def fetch_reference(spec, width=None, height=None):
     return ImageOps.fit(image, (width, height), Image.LANCZOS) if width else image  # Cover-crop to the requested shape.
 
 
+def matched_size(photo_width, photo_height, quality):
+    """The photo's shape at the chosen quality's pixel count, on the 16-pixel grid."""
+    area = SIZED[quality]["square"][0] * SIZED[quality]["square"][1]
+    ratio = min(max(photo_width / photo_height, 1 / 3), 3)
+    return tuple(max(256, round(side / 16) * 16) for side in ((area * ratio) ** 0.5, (area / ratio) ** 0.5))
+
+
 def handler(job):
     data = job.get("input", {})
     try:
@@ -128,6 +155,12 @@ def handler(job):
         return {"error": "This endpoint is configured for a different model."}
     sizes = {(480, 480), (832, 480), (480, 832)} if IS_VIDEO else {(1024, 1024), (1344, 768), (768, 1344)}
     width, height = data.get("width"), data.get("height")
+    match_photo = ARCH == "flux3" and data.get("aspect") == "match"
+    if ARCH == "flux3":
+        quality = data.get("quality", "standard")
+        if quality not in SIZED:
+            return {"error": "Unsupported quality."}
+        sizes = set(SIZED[quality].values())
     if (width, height) not in sizes:
         return {"error": "Unsupported dimensions."}
     seed = data.get("seed", 0)
@@ -140,7 +173,7 @@ def handler(job):
     if ARCH == "wan22" and data.get("reference") is None:
         return {"error": "This model animates a photo. Add a photo and try again."}
     if data.get("reference") is not None:
-        if img2img is None and ARCH not in {"wan22", "klein"}:
+        if img2img is None and ARCH not in {"wan22", "klein", "flux3"}:
             return {"error": "This model cannot use a reference photo."}
         if img2img is not None:  # Only photo-to-image has a strength control.
             strength = data.get("strength", 0.7)
@@ -148,9 +181,13 @@ def handler(job):
                 return {"error": "Strength must be between 0.1 and 1."}
         try:
             # Editing keeps the photo's own shape; everything else is cover-cropped to the requested size.
-            reference = fetch_reference(data["reference"]) if ARCH == "klein" else fetch_reference(data["reference"], width, height)
+            reference = fetch_reference(data["reference"]) if ARCH in {"klein", "flux3"} else fetch_reference(data["reference"], width, height)
         except Exception as error:  # Reported to the user; the web server refunds the credits.
             return {"error": f"The reference photo could not be used: {str(error)[:300]}"}
+    if match_photo:
+        if reference is None:
+            return {"error": "Add a photo to match its shape."}
+        width, height = matched_size(reference.width, reference.height, quality)
     if data.get("style") is not None:
         if ARCH != "sdxl":
             return {"error": "This model cannot use a style reference."}
@@ -181,10 +218,20 @@ def handler(job):
             pipe.unload_lora_weights()  # Never let one user's adapter leak into the next job.
 
 
+class Blocked(Exception):
+    pass
+
+
 def generate(output, p):
     generator = torch.Generator("cpu").manual_seed(p["seed"])
     if ARCH == "flux":
         pipe(prompt=p["prompt"], width=p["width"], height=p["height"], generator=generator, num_inference_steps=4, guidance_scale=0.0, max_sequence_length=256).images[0].save(output)
+    elif ARCH == "flux3":
+        extra = {"image": p["reference"]} if p["reference"] is not None else {}
+        image = pipe(prompt=p["prompt"], width=p["width"], height=p["height"], num_inference_steps=16, generator=generator, output="images", **extra)[0]
+        if any(r["label"] == "nsfw" and r["score"] >= SAFETY_THRESHOLD for r in safety(image)):
+            raise Blocked("The result was blocked by the content filter. Try a different prompt or photo.")
+        image.save(output)
     elif ARCH == "klein":
         size = {} if p["reference"] is not None else {"height": p["height"], "width": p["width"]}  # With a photo, the output follows its shape.
         image = pipe(image=[p["reference"]] if p["reference"] is not None else None, prompt=p["prompt"], guidance_scale=1.0, num_inference_steps=4, generator=generator, **size).images[0]
@@ -217,7 +264,10 @@ def run(p, user_id, job_id):
     with torch.inference_mode(), tempfile.TemporaryDirectory() as temp:
         output = Path(temp) / ("output.mp4" if IS_VIDEO else "output.png")
         mime = "video/mp4" if IS_VIDEO else "image/png"
-        generate(output, p)
+        try:
+            generate(output, p)
+        except Blocked as error:  # Reported to the user; the web server refunds the credits.
+            return {"error": str(error)}
         key = f"{user_id}/{job_id}{output.suffix}"
         if output.stat().st_size > 104857600:
             return {"error": "Generated file exceeds the 100 MB storage limit."}
