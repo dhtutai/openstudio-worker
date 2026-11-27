@@ -1,34 +1,50 @@
 """One model per RunPod queue worker. GPU inference + private Supabase Storage."""
+import io
 import os
 import re
 import tempfile
 import uuid
+import urllib.error
 import urllib.request
 from pathlib import Path
 import runpod
 from huggingface_hub import hf_hub_download
 import torch
-from diffusers import FluxPipeline, WanPipeline, AutoencoderKLWan
+from PIL import Image, ImageOps
+from diffusers import AutoPipelineForImage2Image, AutoencoderKLWan, FluxPipeline, StableDiffusionXLPipeline, WanPipeline
 from diffusers.utils import export_to_video
 
+Image.MAX_IMAGE_PIXELS = 40_000_000  # Refuse decompression bombs from uploaded photos.
+
+# MODEL_ARCH picks the model family. MODEL_KIND is kept for older endpoints: image -> flux, video -> wan.
 KIND = os.getenv("MODEL_KIND", "image")
-if KIND not in {"image", "video"}:
-    raise RuntimeError("MODEL_KIND must be image or video")
-MODEL_ID = os.getenv("MODEL_ID", "black-forest-labs/FLUX.1-schnell" if KIND == "image" else "Wan-AI/Wan2.1-T2V-1.3B-Diffusers")
+ARCH = os.getenv("MODEL_ARCH") or ("wan" if KIND == "video" else "flux")
+DEFAULT_MODELS = {"flux": "black-forest-labs/FLUX.1-schnell", "sdxl": "stabilityai/stable-diffusion-xl-base-1.0", "wan": "Wan-AI/Wan2.1-T2V-1.3B-Diffusers"}
+if ARCH not in DEFAULT_MODELS:
+    raise RuntimeError("MODEL_ARCH must be flux, sdxl or wan")
+IS_VIDEO = ARCH == "wan"
+MODEL_ID = os.getenv("MODEL_ID", DEFAULT_MODELS[ARCH])
 SUPABASE_URL = os.environ["SUPABASE_URL"].rstrip("/")
 SUPABASE_KEY = os.environ["SUPABASE_SERVICE_ROLE_KEY"]
-if KIND == "image":
+HF_TOKEN = os.getenv("HF_TOKEN") or None
+img2img = None
+if ARCH == "flux":
     pipe = FluxPipeline.from_pretrained(MODEL_ID, torch_dtype=torch.bfloat16)
+    pipe.enable_model_cpu_offload()  # Offload reduces VRAM needs; cold starts and CPU transfers add latency.
+    pipe.vae.enable_tiling()
+elif ARCH == "sdxl":
+    pipe = StableDiffusionXLPipeline.from_pretrained(MODEL_ID, torch_dtype=torch.float16, variant="fp16", use_safetensors=True)
+    pipe.to("cuda")  # SDXL fits on a 24 GB card without offload.
+    img2img = AutoPipelineForImage2Image.from_pipe(pipe)  # Shares the same weights; used when a reference photo is given.
 else:
     vae = AutoencoderKLWan.from_pretrained(MODEL_ID, subfolder="vae", torch_dtype=torch.float32)
     pipe = WanPipeline.from_pretrained(MODEL_ID, vae=vae, torch_dtype=torch.bfloat16)
-# Offload reduces VRAM requirements; cold starts and CPU transfers add latency.
-pipe.enable_model_cpu_offload()
-pipe.vae.enable_tiling()
+    pipe.enable_model_cpu_offload()
+    pipe.vae.enable_tiling()
 
-HF_TOKEN = os.getenv("HF_TOKEN") or None
 LORA_DIR = Path(os.getenv("LORA_CACHE", "/runpod-volume/loras"))
 LORA_MAX_BYTES = int(os.getenv("LORA_MAX_MB", "500")) * 1024 * 1024
+REFERENCE_MAX_BYTES = 25 * 1024 * 1024
 UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
 REPO_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,95}/[A-Za-z0-9][A-Za-z0-9._-]{0,95}$")
 FILE_RE = re.compile(r"^[A-Za-z0-9._/-]{1,200}\.safetensors$")
@@ -73,6 +89,22 @@ def fetch_lora(spec):
     raise ValueError("Unknown LoRA source.")
 
 
+def fetch_reference(spec, width, height):
+    """Download the user's reference photo from a signed Supabase link and fit it to the output size."""
+    url = spec.get("url") if isinstance(spec, dict) else None
+    if not isinstance(url, str) or not url.startswith(f"{SUPABASE_URL}/storage/v1/object/sign/"):
+        raise ValueError("Invalid reference photo link.")
+    with urllib.request.urlopen(url, timeout=60) as response:
+        raw = response.read(REFERENCE_MAX_BYTES + 1)
+    if len(raw) > REFERENCE_MAX_BYTES:
+        raise ValueError("The reference photo is larger than 25 MB.")
+    image = Image.open(io.BytesIO(raw))
+    if image.format not in {"PNG", "JPEG", "WEBP"}:
+        raise ValueError("The reference photo must be a PNG, JPG or WebP image.")
+    image = ImageOps.exif_transpose(image).convert("RGB")
+    return ImageOps.fit(image, (width, height), Image.LANCZOS)  # Cover-crop to the requested shape.
+
+
 def handler(job):
     data = job.get("input", {})
     try:
@@ -82,9 +114,9 @@ def handler(job):
     prompt = data.get("prompt", "")
     if not isinstance(prompt, str) or not 1 <= len(prompt.strip()) <= 2000:
         return {"error": "Prompt must contain 1–2000 characters."}
-    if data.get("model") != ("flux" if KIND == "image" else "wan"):
-        return {"error": "This endpoint is configured for a different model kind."}
-    sizes = {(1024, 1024), (1344, 768), (768, 1344)} if KIND == "image" else {(480, 480), (832, 480), (480, 832)}
+    if data.get("model") != ARCH:
+        return {"error": "This endpoint is configured for a different model."}
+    sizes = {(480, 480), (832, 480), (480, 832)} if IS_VIDEO else {(1024, 1024), (1344, 768), (768, 1344)}
     width, height = data.get("width"), data.get("height")
     if (width, height) not in sizes:
         return {"error": "Unsupported dimensions."}
@@ -94,13 +126,24 @@ def handler(job):
     negative = data.get("negative_prompt", "")
     if not isinstance(negative, str) or len(negative) > 2000:
         return {"error": "Invalid negative prompt."}
+    reference = strength = None
+    if data.get("reference") is not None:
+        if img2img is None:
+            return {"error": "This model cannot use a reference photo."}
+        strength = data.get("strength", 0.7)
+        if isinstance(strength, bool) or not isinstance(strength, (int, float)) or not 0.1 <= strength <= 1:
+            return {"error": "Strength must be between 0.1 and 1."}
+        try:
+            reference = fetch_reference(data["reference"], width, height)
+        except Exception as error:  # Reported to the user; the web server refunds the credits.
+            return {"error": f"The reference photo could not be used: {str(error)[:300]}"}
     lora_path = lora_strength = None
     if data.get("lora") is not None:
         try:
             lora_path, lora_strength = fetch_lora(data["lora"])
-        except Exception as error:  # Reported to the user; the job is refunded by the web server.
+        except Exception as error:
             return {"error": f"LoRA could not be loaded: {str(error)[:300]}"}
-    options = dict(prompt=prompt, width=width, height=height, generator=torch.Generator("cpu").manual_seed(seed))
+    params = dict(prompt=prompt, negative=negative, width=width, height=height, seed=seed, reference=reference, strength=strength)
     try:
         if lora_path:
             try:
@@ -108,23 +151,32 @@ def handler(job):
                 pipe.set_adapters(["user"], adapter_weights=[lora_strength])
             except Exception as error:  # Usually a LoRA trained for a different architecture.
                 return {"error": f"This LoRA could not be applied to the model: {str(error)[:300]}"}
-        return run(options, user_id, job_id, seed, negative)
+        return run(params, user_id, job_id)
     finally:
         if lora_path:
             pipe.unload_lora_weights()  # Never let one user's adapter leak into the next job.
 
 
-def run(options, user_id, job_id, seed, negative):
-    with torch.inference_mode(), tempfile.TemporaryDirectory() as temp:
-        if KIND == "image":
-            output = Path(temp) / "output.png"
-            pipe(**options, num_inference_steps=4, guidance_scale=0.0, max_sequence_length=256).images[0].save(output)
-            mime = "image/png"
+def generate(output, p):
+    generator = torch.Generator("cpu").manual_seed(p["seed"])
+    if ARCH == "flux":
+        pipe(prompt=p["prompt"], width=p["width"], height=p["height"], generator=generator, num_inference_steps=4, guidance_scale=0.0, max_sequence_length=256).images[0].save(output)
+    elif ARCH == "sdxl":
+        if p["reference"] is not None:
+            image = img2img(prompt=p["prompt"], negative_prompt=p["negative"] or None, image=p["reference"], strength=p["strength"], num_inference_steps=30, guidance_scale=6.0, generator=generator).images[0]
         else:
-            output = Path(temp) / "output.mp4"
-            frames = pipe(**options, negative_prompt=negative, num_frames=81, num_inference_steps=30, guidance_scale=5.0).frames[0]
-            export_to_video(frames, str(output), fps=16)
-            mime = "video/mp4"
+            image = pipe(prompt=p["prompt"], negative_prompt=p["negative"] or None, width=p["width"], height=p["height"], num_inference_steps=30, guidance_scale=6.0, generator=generator).images[0]
+        image.save(output)
+    else:
+        frames = pipe(prompt=p["prompt"], width=p["width"], height=p["height"], generator=generator, negative_prompt=p["negative"], num_frames=81, num_inference_steps=30, guidance_scale=5.0).frames[0]
+        export_to_video(frames, str(output), fps=16)
+
+
+def run(p, user_id, job_id):
+    with torch.inference_mode(), tempfile.TemporaryDirectory() as temp:
+        output = Path(temp) / ("output.mp4" if IS_VIDEO else "output.png")
+        mime = "video/mp4" if IS_VIDEO else "image/png"
+        generate(output, p)
         key = f"{user_id}/{job_id}{output.suffix}"
         if output.stat().st_size > 104857600:
             return {"error": "Generated file exceeds the 100 MB storage limit."}
@@ -133,11 +185,13 @@ def run(options, user_id, job_id, seed, negative):
             data=output.read_bytes(), method="POST",
             headers={"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}", "Content-Type": mime, "x-upsert": "true"},
         )
-        with urllib.request.urlopen(request, timeout=120) as response:
-            if response.status not in (200, 201):
-                raise RuntimeError("Private output upload failed")
-        return {"storage_path": key, "mime": mime, "seed": seed}
-
+        try:
+            with urllib.request.urlopen(request, timeout=120) as response:
+                if response.status not in (200, 201):
+                    raise RuntimeError("Private output upload failed")
+        except urllib.error.HTTPError as error:  # Include Supabase's explanation (e.g. a missing bucket) in the job error.
+            raise RuntimeError(f"Output upload failed: HTTP {error.code} {error.read(300).decode('utf-8', 'replace')}") from error
+        return {"storage_path": key, "mime": mime, "seed": p["seed"]}
 
 
 if __name__ == "__main__":
