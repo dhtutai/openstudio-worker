@@ -1,0 +1,16 @@
+FROM pytorch/pytorch:2.10.0-cuda12.8-cudnn9-runtime
+RUN apt-get update && apt-get install -y --no-install-recommends git ffmpeg libgl1 libglib2.0-0 && rm -rf /var/lib/apt/lists/*
+# Supply a tested ComfyUI commit when building a release. No third-party custom nodes.
+# This base image's Python is marked as managed by the system, so pip refuses to install into it without this.
+# The container exists only for this worker.
+ENV PIP_BREAK_SYSTEM_PACKAGES=1
+ARG COMFY_REV=master
+RUN git clone https://github.com/Comfy-Org/ComfyUI.git /opt/ComfyUI && cd /opt/ComfyUI && git checkout "$COMFY_REV" && git rev-parse HEAD > /opt/comfy-revision
+RUN pip install --no-cache-dir -r /opt/ComfyUI/requirements.txt 'runpod>=1.7,<2' 'huggingface_hub>=1,<2'
+RUN test -f /opt/ComfyUI/comfy_extras/nodes_minimax_h3.py
+WORKDIR /app
+COPY sulphur_graph.py sulphur_handler.py check_sulphur_nodes.py ./
+# Fail the build, not a paid GPU job, if the install replaced CUDA PyTorch or ComfyUI lacks a node the graph needs.
+RUN python -c "import torch, runpod, huggingface_hub; assert torch.version.cuda, 'PyTorch lost CUDA support'" && python check_sulphur_nodes.py
+ENV HF_HOME=/runpod-volume/huggingface
+CMD ["python", "-u", "sulphur_handler.py"]
