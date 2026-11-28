@@ -58,7 +58,7 @@ class NoRedirect(urllib.request.HTTPRedirectHandler):
         return None
 
 
-def reference_photo(spec, target, supabase):
+def reference_photo(spec, target, supabase, size):
     from PIL import Image, ImageOps
     Image.MAX_IMAGE_PIXELS = 40_000_000
     url = spec.get('url') if isinstance(spec, dict) else None
@@ -71,7 +71,8 @@ def reference_photo(spec, target, supabase):
     image = Image.open(io.BytesIO(raw))
     if image.format not in {'PNG', 'JPEG', 'WEBP'}:
         raise ValueError('Reference must be PNG, JPEG or WebP.')
-    ImageOps.exif_transpose(image).convert('RGB').save(target)
+    # ComfyUI stretches a first frame to the video's shape, so crop it to that shape first.
+    ImageOps.fit(ImageOps.exif_transpose(image).convert('RGB'), size, Image.LANCZOS).save(target)
 
 
 def handler(job):
@@ -87,7 +88,7 @@ def handler(job):
     try:
         if data.get('reference') is not None:
             reference.parent.mkdir(parents=True, exist_ok=True)
-            reference_photo(data['reference'], reference, supabase)
+            reference_photo(data['reference'], reference, supabase, (data['width'], data['height']))
             graph = build_graph(data, prefix, reference.name)
         # Never retry a submission: an uncertain response might already be running.
         submitted = api('/prompt', {'prompt': graph, 'client_id': job_id})
